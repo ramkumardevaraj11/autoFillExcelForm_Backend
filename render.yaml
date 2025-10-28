@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: man-machine-app-backend
+    env: python
+    plan: starter
+    branch: master
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 8000
+    autoDeploy: true
+
+databases:
+  - name: man-machine-db
+    plan: starter
+
+envVars:
+  - key: DATABASE_URL
+    fromDatabase:
+      name: man-machine-db
+      property: connectionString
+  # Add more custom environment variables below
+  # - key: CUSTOM_KEY
+  #   value: custom_value
