@@ -24,4 +24,10 @@ uploads/
 .DS_Store
 Thumbs.db
 
+# Secrets and API tokens
+*Token*
+*API*Token*
+hugingFaceAPITOken
+../hugingFaceAPITOken
+
 
