@@ -8,6 +8,9 @@ import re
 import openpyxl
 from openpyxl.cell.cell import MergedCell
 from datetime import datetime
+from fastapi import HTTPException
+import pdfplumber
+
 
 app = FastAPI()
 
@@ -67,29 +70,42 @@ def read_pdf_text(file_path):
     log("Step 3: Finished reading PDF. Total length:", len(text))
     return text
 
-def extract_insurance_company(pdf_text):
-    log("Step 10: Extracting INSURANCE COMPANY from PDF")
-    lines = pdf_text.splitlines()
-    stop_words = ("address", "city", "zip", "state", "sex", "dob", "date of birth", "patient", "subscriber", "group",
-                  "plan", "policyholder", "phone", "tel", "member", "mrn", "claim")
-    for i, line in enumerate(lines):
-        if re.search(r"Primary\s*Ins\s*:", line, re.IGNORECASE):
-            after_colon = line.split(":", 1)[-1].strip()
-            company_lines = []
-            if after_colon:
-                company_lines.append(after_colon)
-            for j in range(i+1, len(lines)):
-                nextline = lines[j].strip()
-                if (not nextline or
-                    any(sw in nextline.lower() for sw in stop_words) or
-                    re.match(r"^\d{5,}$", nextline)):
-                    break
-                company_lines.append(nextline)
-            company = " ".join(company_lines)
-            company = re.sub(r"\s{2,}", " ", company).strip(" ,.-")
-            log(f"✓ Found Insurance Company: '{company}'")
+def extract_insurance_company(pdf_path):
+    import pdfplumber
+    with pdfplumber.open(pdf_path) as pdf:
+        page = pdf.pages[0]
+        # Grab all potential text lines from page 1
+        lines = [line.strip() for line in (page.extract_text() or "").splitlines() if line.strip()]
+        candidates = []
+        for line in lines:
+            ll = line.lower()
+            # Must have 'insurance' and be more than one word
+            if ("insurance" in ll
+                and len(line.split()) > 1
+                and not ll.startswith("new york")
+                and not ll.startswith("verification")
+                and not ll.startswith("law")
+                and not ll.startswith("page")
+                and not ll.isupper()  # skip ALL CAPS narratives
+            ):
+                candidates.append(line)  # collect all plausible company lines
+        
+        # Extra robustness: pick the one where all words are alpha and not just 'LAW'
+        companies = [
+            cand for cand in candidates
+            if all(word.isalpha() or "." in word for word in cand.split())
+            and cand.count(" ") < 5  # not too long, helps isolate "CURE AUTO INSURANCE"
+        ]
+        if companies:
+            company = companies[0].strip()
+            log(f"✓ Insurance company selected: '{company}'")
             return company
-    log("WARNING: Could not extract insurance company. Using placeholder.")
+        if candidates:
+            company = candidates[0].strip()
+            log(f"✓ Insurance company fallback: '{company}'")
+            return company
+
+    log("WARNING: Insurance company not found on page 1; returning blank.")
     return ""
 
 def extract_name_by_label(pdf_text, label_keywords):
@@ -417,71 +433,356 @@ def write_to_excel(form_path, patient_name, policyholder_name, address, contact_
         return ""
     return output_file
 
-@app.post("/upload/")
-async def upload_files(encounter_pdf: UploadFile = File(...), aptp_form: UploadFile = File(...)):
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    pdf_path = os.path.join(UPLOAD_DIR, encounter_pdf.filename)
-    form_path = os.path.join(UPLOAD_DIR, aptp_form.filename)
-    with open(pdf_path, "wb") as pdf_f:
-        pdf_f.write(await encounter_pdf.read())
-    with open(form_path, "wb") as form_f:
-        form_f.write(await aptp_form.read())
-    try:
-        pdf_text = read_pdf_text(pdf_path)
-        patient_name = extract_patient_name(pdf_text)
-        policyholder_name = extract_policyholder_name(pdf_text)
-        address = extract_address(pdf_text)
-        contact_info = extract_telephone(pdf_text)
-        birthdate_str = extract_birthdate(pdf_text)
-        sex_value = extract_sex(pdf_text)
-        insurance_company = extract_insurance_company(pdf_text)
-        patient_info = PatientInfo(birthdate=birthdate_str, sex=sex_value)
-        output_file_path = write_to_excel(
-            form_path, patient_name, policyholder_name, address, contact_info, patient_info, sex_value, insurance_company
-        )
-        if not output_file_path:
-            return {"error": "Failed to process form"}
-        filename = os.path.basename(output_file_path)
-        return {
-            "message": "Files processed successfully! 🎉",
-            "download_url": f"/download/{filename}",
-            "extracted_data": {
-                "patient": {
-                    "last_name": patient_name.last_name,
-                    "first_name": patient_name.first_name,
-                    "initial": patient_name.initial,
-                    "birthdate": patient_info.birthdate,
-                    "sex": patient_info.sex
-                },
-                "address": {
-                    "street": address.street,
-                    "city": address.city,
-                    "state": address.state,
-                    "zip_code": address.zip_code
-                },
-                "contact": {
-                    "telephone": contact_info.telephone
-                },
-                "insurance_company": insurance_company,
-                "policyholder": {
-                    "last_name": policyholder_name.last_name if policyholder_name else patient_name.last_name,
-                    "first_name": policyholder_name.first_name if policyholder_name else patient_name.first_name,
-                    "initial": policyholder_name.initial if policyholder_name else patient_name.initial
-                }
-            }
+def extract_psa_pdf_values(pdf_path, pdf_text):
+    today_date = datetime.today().strftime('%m/%d/%Y')
+    insurance_company = extract_insurance_company(pdf_path)
+    date_of_loss = extract_date_of_accident(pdf_text)
+    return today_date, insurance_company, date_of_loss
+
+def extract_claim_number(pdf_text):
+    log("Step: Extracting CLAIM NUMBER (enhanced multi-line lookahead)")
+    lines = [line.strip() for line in pdf_text.splitlines() if line.strip()]
+    header_keywords = ["CLAIM NUMBER", "CLAIM #", "POLICY NUMBER"]
+    for i, line in enumerate(lines):
+        for key in header_keywords:
+            if key.replace(" ", "") in line.upper().replace(" ", ""):
+                # Inline (on same line)
+                match_inline = re.search(rf"{key}[:\s\-]*([A-Z0-9\-]{{6,}})", line.upper())
+                if match_inline:
+                    claim = match_inline.group(1)
+                    log(f"✓ Claim number found inline: '{claim}'")
+                    return claim
+                # Look for best candidate next 10 lines (not zip, not address, 6+ chars)
+                for j in range(1, 11):
+                    if i+j < len(lines):
+                        candidate = lines[i+j].strip()
+                        if (re.fullmatch(r"[A-Z0-9\-]{6,}", candidate) and 
+                            not re.fullmatch(r"\d{5}", candidate) and 
+                            not any(w in candidate.lower() for w in ("street", "avenue", "drive", "suite")) and
+                            not re.search(r"[a-z]", candidate)):
+                            log(f"✓ Claim candidates found: '{candidate}'")
+                            return candidate
+    log("WARNING: Could not extract claim number; using placeholder.")
+    return ""
+
+def extract_date_of_accident(pdf_text):
+    log("Step: Extracting DATE OF ACCIDENT from PDF")
+    lines = [line.strip() for line in pdf_text.splitlines() if line.strip()]
+    
+    # Pattern 1: Inline with label "DATE OF ACCIDENT: 16 May 2024"
+    pattern_inline = r"DATE\s+OF\s+ACCIDENT[:\s]*(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})"
+    match = re.search(pattern_inline, pdf_text, re.IGNORECASE)
+    if match:
+        day = match.group(1).zfill(2)
+        month_name = match.group(2)
+        year = match.group(3)
+        month_map = {
+            "jan": "01", "feb": "02", "mar": "03", "apr": "04",
+            "may": "05", "jun": "06", "jul": "07", "aug": "08",
+            "sep": "09", "oct": "10", "nov": "11", "dec": "12"
         }
-    except Exception as e:
-        log(f"ERROR: Processing failed: {str(e)}")
+        month = month_map.get(month_name.lower()[:3], "01")
+        formatted = f"{month}/{day}/{year}"
+        log(f"✓ DATE OF ACCIDENT found (text month): '{formatted}'")
+        return formatted
+    
+    # Pattern 2: Numeric formats "05/16/2024" or "2024-05-16"
+    pattern_numeric = r"DATE\s+OF\s+ACCIDENT[:\s]*(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})"
+    match = re.search(pattern_numeric, pdf_text, re.IGNORECASE)
+    if match:
+        month = match.group(1).zfill(2)
+        day = match.group(2).zfill(2)
+        year = match.group(3)
+        formatted = f"{month}/{day}/{year}"
+        log(f"✓ DATE OF ACCIDENT found (numeric): '{formatted}'")
+        return formatted
+    
+    # Pattern 3: Lookahead in next lines after "DATE OF ACCIDENT" label
+    for i, line in enumerate(lines):
+        if "DATE OF ACCIDENT" in line.upper():
+            for j in range(1, 5):
+                if i+j < len(lines):
+                    candidate = lines[i+j].strip()
+                    # Try text month format
+                    match_text = re.match(r"(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{4})", candidate, re.IGNORECASE)
+                    if match_text:
+                        day = match_text.group(1).zfill(2)
+                        month_name = match_text.group(2)
+                        year = match_text.group(3)
+                        month_map = {
+                            "jan": "01", "feb": "02", "mar": "03", "apr": "04",
+                            "may": "05", "jun": "06", "jul": "07", "aug": "08",
+                            "sep": "09", "oct": "10", "nov": "11", "dec": "12"
+                        }
+                        month = month_map.get(month_name.lower()[:3], "01")
+                        formatted = f"{month}/{day}/{year}"
+                        log(f"✓ DATE OF ACCIDENT found (lookahead text): '{formatted}'")
+                        return formatted
+                    # Try numeric format
+                    match_num = re.match(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})", candidate)
+                    if match_num:
+                        month = match_num.group(1).zfill(2)
+                        day = match_num.group(2).zfill(2)
+                        year = match_num.group(3)
+                        formatted = f"{month}/{day}/{year}"
+                        log(f"✓ DATE OF ACCIDENT found (lookahead numeric): '{formatted}'")
+                        return formatted
+    
+    log("WARNING: Could not extract DATE OF ACCIDENT; using placeholder.")
+    return ""
+
+def extract_psa_patient_name(pdf_text):
+    """
+    Extracts PSA patient name from Bill PDF.
+    Handles formats:
+    - "WALKING SAINT JEAN" (3 words: FIRST MIDDLE LAST)
+    - "PEREZ, EDUAR" (LAST, FIRST)
+    - "Patient Name: LASTNAME, FIRSTNAME M"
+    Returns: (last, first, middle_initial)
+    """
+    log("Step: Extracting PSA Patient Name from PDF")
+    
+    # Pattern 1: Look for the structured patient ID line "WALKING  SAINT JEAN-10084-KC43773"
+    # This is a strong anchor because it appears before the claim reference
+    pattern_id = r"([A-Z]+)\s+([A-Z]+)\s+([A-Z]+)-\d+-[A-Z0-9]+"
+    match = re.search(pattern_id, pdf_text)
+    if match:
+        first = match.group(1).title()
+        middle = match.group(2).title()
+        last = match.group(3).title()
+        log(f"✓ PSA Patient Name (ID format): First='{first}', Middle='{middle}', Last='{last}'")
+        return (last, first, middle[0] if middle else "")
+    
+    # Pattern 2: Standard comma-separated "LASTNAME, FIRSTNAME M" after "PATIENT" or "Patient Name"
+    pattern_comma = r"(?:Patient(?:'s)?\s+Name(?:\s+and\s+Address)?|PATIENT)[:\s]*([A-Z][A-Z]+)\s*,\s*([A-Z][A-Z]+)(?:\s+([A-Z]))?"
+    match = re.search(pattern_comma, pdf_text, re.IGNORECASE)
+    if match:
+        last = match.group(1).title()
+        first = match.group(2).title()
+        middle = match.group(3)[0] if match.group(3) else ""
+        if len(last) >= 2 and len(first) >= 2:
+            log(f"✓ PSA Patient Name (comma format): Last='{last}', First='{first}', Middle='{middle}'")
+            return (last, first, middle)
+    
+    # Pattern 3: Three consecutive ALL-CAPS words (avoiding form template words)
+    # Exclude common form words
+    excluded = {"PATIENT", "FIRST", "CONSULT", "CONDITION", "ACCIDENT", "YES", "NO", "DATE", "NAME", "ADDRESS"}
+    words = re.findall(r"\b[A-Z]{2,}\b", pdf_text)
+    # Find first sequence of 3 words not in excluded set
+    for i in range(len(words) - 2):
+        if words[i] not in excluded and words[i+1] not in excluded and words[i+2] not in excluded:
+            first = words[i].title()
+            middle = words[i+1].title()
+            last = words[i+2].title()
+            log(f"✓ PSA Patient Name (3-word sequence): First='{first}', Middle='{middle}', Last='{last}'")
+            return (last, first, middle[0])
+    
+    log("WARNING: PSA Patient Name not found. Using placeholder.")
+    return ("UNKNOWN", "PATIENT", "")
+
+def extract_psa_birthdate(pdf_text):
+    log("Step: Extracting PSA PATIENT DATE OF BIRTH from PDF")
+    # Pattern 1: MM/DD/YYYY or MM-DD-YYYY
+    patterns = [
+        r"(?:DOB|Date of Birth|Birth Date|Birthdate)[:\s]*(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})",
+        r"(?:DOB|Date of Birth|Birth Date|Birthdate)[:\s]*(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})",
+        # Pattern for "24 Mar 1989"
+        r"(?:DOB|Date of Birth|Birth Date|Birthdate)[:\s]*(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[ ,\-]+(\d{4})",
+        # Loose catch-all: dd Mon yyyy, not attached to label
+        r"\b(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[ ,\-]+(\d{4})\b"
+    ]
+    month_map = {
+        "jan": "01", "feb": "02", "mar": "03", "apr": "04",
+        "may": "05", "jun": "06", "jul": "07", "aug": "08",
+        "sep": "09", "oct": "10", "nov": "11", "dec": "12"
+    }
+    for idx, pat in enumerate(patterns):
+        match = re.search(pat, pdf_text, re.IGNORECASE)
+        if match:
+            if idx == 0:  # MM/DD/YYYY
+                month = match.group(1).zfill(2)
+                day = match.group(2).zfill(2)
+                year = match.group(3)
+            elif idx == 1:  # YYYY-MM-DD
+                year = match.group(1)
+                month = match.group(2).zfill(2)
+                day = match.group(3).zfill(2)
+            else:  # Text month
+                day = match.group(1).zfill(2)
+                month_str = match.group(2).lower()[:3]
+                month = month_map.get(month_str, "01")
+                year = match.group(3)
+            formatted = f"{month}/{day}/{year}"
+            log(f"✓ PSA DOB extracted: {formatted}")
+            return formatted
+    log("WARNING: PSA DOB not found.")
+    return ""
+
+def fill_psa_excel(psa_xlsx_path, date_appeal_submitted, insurance_company, claim_number, date_of_loss, psa_last, psa_first, psa_middle, psa_dob):
+    wb = openpyxl.load_workbook(psa_xlsx_path)
+    sheet = wb.active
+
+    def find_and_fill(header, value):
+        for row in sheet.iter_rows():
+            for cell in row:
+                if (
+                    cell.value and
+                    isinstance(cell.value, str) and
+                    header in cell.value.upper()
+                ):
+                    below_row = cell.row + 1
+                    below_col = cell.column
+                    right_row = cell.row
+                    right_col = cell.column + 1
+                    
+                    # Get the actual cell objects
+                    below = sheet.cell(row=below_row, column=below_col)
+                    right = sheet.cell(row=right_row, column=right_col)
+                    
+                    # Check if BELOW is truly empty (not merged, no value)
+                    if not isinstance(below, MergedCell) and below.value in (None, ""):
+                        write_to_cell_safe(sheet, below_row, below_col, value)
+                        log(f"Filled '{header}' BELOW at Row {below_row}, Col {below_col}: {value}")
+                        return True
+                    
+                    # Check if RIGHT is truly empty (not merged, no value)
+                    if not isinstance(right, MergedCell) and right.value in (None, ""):
+                        write_to_cell_safe(sheet, right_row, right_col, value)
+                        log(f"Filled '{header}' RIGHT at Row {right_row}, Col {right_col}: {value}")
+                        return True
+                    
+                    # If both below and right are occupied, try 2 rows below header
+                    below2_row = cell.row + 2
+                    below2 = sheet.cell(row=below2_row, column=below_col)
+                    if not isinstance(below2, MergedCell) and below2.value in (None, ""):
+                        write_to_cell_safe(sheet, below2_row, below_col, value)
+                        log(f"Filled '{header}' 2 ROWS BELOW at Row {below2_row}, Col {below_col}: {value}")
+                        return True
+                    
+                    log(f"WARNING: All target cells for '{header}' are occupied. Skipping fill.")
+                    return False
+        
+        log(f"Could not find field to fill: {header}")
+        return False
+
+
+    find_and_fill("DATE APPEAL SUBMITTED", date_appeal_submitted)
+    find_and_fill("INSURANCE COMPANY", insurance_company)
+    find_and_fill("CLAIM NUMBER", claim_number)
+    find_and_fill("CLAIM #", claim_number)
+    find_and_fill("DATE OF LOSS", date_of_loss)
+
+    # -- PSA Patient Name fields fill-in --
+    find_and_fill("LAST NAME", psa_last)
+    find_and_fill("FIRST NAME", psa_first)
+    find_and_fill("MIDDLE INITIAL", psa_middle)
+    find_and_fill("DATE OF BIRTH", psa_dob)  # NEW
+
+    wb.save(psa_xlsx_path)
+
+@app.post("/upload/")
+async def upload_files(
+    pdf_file: UploadFile = File(...),
+    excel_file: UploadFile = File(...),
+):
+    try:
+        if not (pdf_file and excel_file):
+            raise HTTPException(
+                status_code=400,
+                detail="Both pdf_file and excel_file are required."
+            )
+
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        pdf_filename = pdf_file.filename or ""
+        excel_filename = excel_file.filename or ""
+        pdf_path = os.path.join(UPLOAD_DIR, pdf_filename)
+        excel_path = os.path.join(UPLOAD_DIR, excel_filename)
+        with open(pdf_path, "wb") as f:
+            f.write(await pdf_file.read())
+        with open(excel_path, "wb") as f:
+            f.write(await excel_file.read())
+        pdf_name = pdf_filename.lower()
+        excel_name = excel_filename.lower()
+
+        # EXTENSION CHECK
+        if not (pdf_name.endswith(".pdf") and (excel_name.endswith(".xls") or excel_name.endswith(".xlsx"))):
+            raise HTTPException(
+                status_code=400,
+                detail="Files must be .pdf and .xls or .xlsx extensions."
+            )
+        # ----------- APTP/ENCOUNTER logic ----------
+        if "encounter" in pdf_name and "aptp" in excel_name:
+            try:
+                pdf_text = read_pdf_text(pdf_path)
+                patient_name = extract_patient_name(pdf_text)
+                policyholder_name = extract_policyholder_name(pdf_text)
+                address = extract_address(pdf_text)
+                contact_info = extract_telephone(pdf_text)
+                birthdate_str = extract_birthdate(pdf_text)
+                sex_value = extract_sex(pdf_text)
+                insurance_company = extract_insurance_company(pdf_path)
+                if not isinstance(insurance_company, str):
+                    insurance_company = ""
+                patient_info = PatientInfo(birthdate=birthdate_str, sex=sex_value)
+                output_file_path = write_to_excel(
+                    excel_path, patient_name, policyholder_name, address, contact_info, patient_info, sex_value, insurance_company
+                )
+                if not output_file_path:
+                    raise HTTPException(status_code=500, detail="Failed to process form")
+                # Save as original Excel filename in output for auto-download
+                output_final_path = os.path.join(OUTPUT_DIR, excel_filename)
+                os.replace(output_file_path, output_final_path)
+                return {
+                    "message": "APTP Form processed successfully.",
+                    "download_url": f"/download/{excel_filename}"
+                }
+            except Exception as e:
+                log(f"APTP processing failed: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                raise HTTPException(status_code=500, detail=f"APTP Processing failed: {str(e)}")
+
+        # ----------- PSA/BILL logic ----------------
+        if pdf_name.startswith("bill") and "psa" in excel_name:
+            log("Received Bill PDF and PSA Excel files. Extracting/auto-filling fields...")
+            pdf_text = read_pdf_text(pdf_path)
+            date_appeal, ins_company, date_of_loss = extract_psa_pdf_values(pdf_path, pdf_text)
+            claim_number = extract_claim_number(pdf_text)
+            psa_last, psa_first, psa_middle = extract_psa_patient_name(pdf_text)
+            psa_dob = extract_psa_birthdate(pdf_text)  # NEW - reuse existing APTP function
+            
+            log(f"Extracted PSA PATIENT: LAST={psa_last}, FIRST={psa_first}, MIDDLE={psa_middle}")
+            log(f"Extracted PSA DATE OF BIRTH: {psa_dob}")
+
+            fill_psa_excel(
+                excel_path, date_appeal, ins_company, claim_number, date_of_loss,
+                psa_last, psa_first, psa_middle, psa_dob  # NEW parameter
+            )
+            output_psa_path = os.path.join(OUTPUT_DIR, excel_filename)
+            os.replace(excel_path, output_psa_path)
+            return {
+                "message": "Bill PDF & PSA Excel processed successfully.",
+                "download_url": f"/download/{excel_filename}"
+            }
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file combination. Only (Encounter PDF + APTP Excel) and (Bill PDF + PSA Excel) allowed."
+        )
+    except Exception as ex:
+        log(f"SERVER ERROR: {str(ex)}")
         import traceback
         traceback.print_exc()
-        return {"error": f"Processing failed: {str(e)}"}
+        raise HTTPException(status_code=500, detail=f"Server error: {str(ex)}")
 
 @app.get("/download/{filename}")
 def download_file(filename: str):
     file_path = os.path.join(OUTPUT_DIR, filename)
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="File not found.")
     return FileResponse(
-        path=file_path, 
-        filename=filename, 
+        path=file_path,
+        filename=filename,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
